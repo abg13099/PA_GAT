@@ -1,42 +1,17 @@
-import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
 import numpy as np
 import networkx as nx
-from scipy.linalg import eigh
 import torch
-import torch.nn.functional as F
-from torch import nn, optim
-import torch_geometric # Added this line
-from torch_geometric.utils import to_networkx
-from torch_geometric.nn import GATConv
-from torch_geometric.nn import global_mean_pool 
-from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
 from community import community_louvain as co_louvain
 import random
 from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader
+from torch_geometric.utils import to_networkx
 from sklearn.model_selection import StratifiedKFold
 from sklearn.cluster import SpectralClustering
 from networkx.algorithms import community
+from scipy.linalg import eigh
 from itertools import product
-import sys
-import os
-import csv
-import gc
-import optuna
-from optuna.pruners import MedianPruner
-from optuna.samplers import TPESampler
-from optuna.samplers import CmaEsSampler
-# ------------------- Utility: set seeds -------------------
-def set_seed(seed):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 def extract_largest_connected_component(data):
     G_nx = to_networkx(data, to_undirected=True)
@@ -247,7 +222,6 @@ def attach_weights_from_D(data, D, node_to_idx, nodes_list, clip_negative=True, 
 
     return data
 
-# ------------------- Compute diffused Laplacian weights -------------------
 def compute_diffused_laplacian_weights(data,
                                        alpha=0.1,
                                        base_anisotropy_c=1,
@@ -286,112 +260,6 @@ def compute_diffused_laplacian_weights(data,
     return data, num_communities
 
 
-class WeightedGATConv(MessagePassing):
-    def __init__(self, in_channels, out_channels, heads=1, concat=True, dropout=0.0, add_self_loops=True, bias=True):
-        super().__init__(aggr='add', node_dim=0)
-        self.in_channels, self.out_channels, self.heads, self.concat = in_channels, out_channels, heads, concat
-        self.dropout, self.add_self_loops = dropout, add_self_loops
-        self.lin = nn.Linear(in_channels, heads * out_channels, bias=False)
-        self.att_l = nn.Parameter(torch.Tensor(1, heads, out_channels))
-        self.att_r = nn.Parameter(torch.Tensor(1, heads, out_channels))
-        if bias and concat:
-            self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
-        elif bias and not concat:
-            self.bias = nn.Parameter(torch.Tensor(out_channels))
-        else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.lin.weight)
-        nn.init.xavier_uniform_(self.att_l)
-        nn.init.xavier_uniform_(self.att_r)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-
-    def forward(self, x, edge_index, edge_weight=None):
-        x_trans = self.lin(x)
-        N = x_trans.size(0)
-        x_trans = x_trans.view(N, self.heads, self.out_channels)
-
-        if self.add_self_loops:
-            self_loops = torch.arange(N, device=edge_index.device)
-            self_loops = torch.stack([self_loops, self_loops], dim=0)
-            edge_index = torch.cat([edge_index, self_loops], dim=1)
-            if edge_weight is None:
-                edge_weight = torch.ones(edge_index.size(1), device=x_trans.device)
-            else:
-                edge_weight = torch.cat([edge_weight, torch.ones(N, device=edge_weight.device)], dim=0)
-
-        out = self.propagate(edge_index, x=x_trans, edge_weight=edge_weight, size=(N, N))
-        out = out.view(N, self.heads * self.out_channels) if self.concat else out.mean(dim=1)
-        if self.bias is not None:
-            out = out + self.bias
-        return out
-
-    def message(self, x_j, x_i, edge_index_i, edge_weight):
-        el = (x_i * self.att_l).sum(dim=-1)
-        er = (x_j * self.att_r).sum(dim=-1)
-        e = F.leaky_relu(el + er, negative_slope=0.2)
-        if edge_weight is not None:
-            e = e * edge_weight.unsqueeze(-1)
-        alpha = softmax(e, index=edge_index_i)
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
-        return x_j * alpha.unsqueeze(-1)
-
-# ------------------- Weighted GAT GraphNet -------------------
-class WeightedGATGraphNet(nn.Module):
-    def __init__(self, in_dim, hidden_dim=64, num_layers=2, num_classes=7, dropout_rate=0.5, heads=4):
-        super().__init__()
-
-        self.convs, self.bns, self.dropout = nn.ModuleList(), nn.ModuleList(), nn.Dropout(dropout_rate)
-        self.heads = heads
-
-        for i in range(num_layers):
-            in_ch = in_dim if i == 0 else hidden_dim * heads
-            self.convs.append(WeightedGATConv(in_ch, hidden_dim, concat=True, heads=heads, dropout=dropout_rate))
-            self.bns.append(nn.BatchNorm1d(hidden_dim * heads))
-
-        self.classifier = nn.Linear(hidden_dim * heads, num_classes)
-
-    def forward(self, x, edge_index, batch, edge_weight=None):
-        if edge_weight is not None:
-            edge_weight = softmax(edge_weight, edge_index[0])
-        for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index, edge_weight=edge_weight)
-            x = self.bns[i](x)
-            x = F.elu(x)
-            x = self.dropout(x)
-        x = global_mean_pool(x, batch)
-        return F.log_softmax(self.classifier(x), dim=1)
-
-# ------------------- Training & Evaluation -------------------
-def train_graph(model, loader, optimizer, device):
-    model.train()
-    total_loss = 0
-    for batch in loader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        out = model(batch.x, batch.edge_index, batch.batch, edge_weight = batch.edge_weight if hasattr(batch, 'edge_weight') else None)
-        loss = F.nll_loss(out, batch.y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
-
-def test_graph(model, loader, device):
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            out = model(batch.x, batch.edge_index, batch.batch, edge_weight = batch.edge_weight if hasattr(batch, 'edge_weight') else None)
-            pred = out.argmax(dim=1)
-            correct += pred.eq(batch.y).sum().item()
-            total += batch.y.size(0)
-    return correct/total 
-
 def compute_structural_features(data):
     G = to_networkx(data, to_undirected = True)
     nodes = list(G.nodes())
@@ -411,14 +279,11 @@ def prepare_tu_dataset(name, root='data/TU', diffusion_params=None):
     num_classes = dataset.num_classes
     num_features = dataset.num_features
 
+    print(f"First graph x: {dataset[0].x}")
+    print(f"First graph y: {dataset[0].y}")
 
     #Sometimes data is empty
-    dataset = [data for data in dataset if data.y is not None]
-
-    if dataset[0].x is None:
-        print(f"No node features found for {name}, using constant features")
-        dataset = [compute_structural_features(d) for d in dataset]
-        num_features = 2
+    dataset = [data for data in dataset if data.x is not None and data.y is not None]
 
     if diffusion_params:
         processed=[]
@@ -430,127 +295,3 @@ def prepare_tu_dataset(name, root='data/TU', diffusion_params=None):
             processed.append(data)
         dataset = processed
     return dataset, num_classes, num_features 
-
-def k_fold(dataset, folds=10, seed=42):
-    skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
-
-    labels = [data.y.item() for data in dataset]
-
-    train_indices, test_indices = [], []
-    for train_idx, test_idx in skf.split(torch.zeros(len(dataset)), labels):
-        train_indices.append(torch.tensor(train_idx, dtype=torch.long))
-        test_indices.append(torch.tensor(test_idx, dtype=torch.long))
-
-    return train_indices, test_indices
-
-def objective(trial, input_dataset, device):
-    alpha = trial.suggest_float('alpha', 0.05, 5, log=True)
-    c = trial.suggest_float('c', 0.1, 10.0, log=True)
-    beta = trial.suggest_float('beta', 0.005, 3, log=True)
-
-    diffusion_params = dict(alpha=alpha, base_anisotropy_c=c, beta=beta)
-
-    try:
-        dataset, num_classes, num_features = prepare_tu_dataset(
-             name=input_dataset, diffusion_params=diffusion_params
-         )
-    except Exception as e:
-         print(f"Preprocessing failed: {e} skipping combination")
-         raise optuna.exceptions.TrialPruned()
-
-    print(f"Running experiment with: alpha: {alpha}, c: {c}, beta: {beta}")
-
-    train_indices, test_indices = k_fold(dataset, folds=5, seed=42)
-    fold_accs = []
-
-    for fold_idx in range(5):
-        train_dataset = [dataset[i] for i in train_indices[fold_idx]]
-        test_dataset = [dataset[i] for i in test_indices[fold_idx]]
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-        model = WeightedGATGraphNet(
-            in_dim=num_features, hidden_dim=64, num_layers=2,
-            num_classes=num_classes, dropout_rate=0.5, heads=8
-        ).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-
-        best_acc = 0.0
-        patience_count = 0
-        PATIENCE=50
-
-        for epoch in range(1,501):
-            train_graph(model, train_loader, optimizer, device)
-            
-            acc = test_graph(model, test_loader, device)
-            if acc > best_acc:
-                best_acc = acc
-                patience_count = 0
-            else:
-                patience_count += 1
-            if patience_count >= 50:
-                break
-
-        fold_accs.append(best_acc)
-        del model, optimizer, train_loader, test_loader
-        del train_dataset, test_dataset
-        gc.collect()
-
-        trial.report(float(np.mean(fold_accs)), step=fold_idx)
-        if trial.should_prune():
-            print("Was gonna prune")
-            # raise optuna.exceptions.TrialPruned()
-
-    del dataset
-    gc.collect()
-    return float(np.mean(fold_accs))
-
-if __name__ == "__main__":
-    set_seed(42)
-    n_trials = 25
-    if len(sys.argv) > 1:
-        input_dataset = sys.argv[1]
-        if len(sys.argv) > 2:
-            n_trials = int(sys.argv[2])
-    else:
-        print("Requires input of dataset")
-        exit(1)
-
-    # Check current settings
-    print(torch.get_num_threads())
-
-    # Set PyTorch to use all 20 cores
-    torch.set_num_threads(15)
-    torch.set_num_interop_threads(15) 
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs('results', exist_ok=True)
-    results_path = 'results/results.csv'
-    study = optuna.create_study(
-        direction='maximize',
-        sampler=CmaEsSampler(seed=42, 
-                                n_startup_trials=20,
-                                sigma0=0.8  # smaller sigma = tighter search around that point
-                             ),
-        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=2)
-    )
-
-    study.optimize(
-        lambda trial: objective(trial, input_dataset, device),
-        n_trials=n_trials,
-        show_progress_bar=True
-    )
-
-    best = study.best_params
-    diffusion_params = dict(
-        alpha=best['alpha'],
-        base_anisotropy_c=best['c'],
-        beta=best['beta']
-    )
-
-    values = [t.value for t in study.trials if t.value is not None]
-    sigma = np.std(values)
-
-    importances = optuna.importance.get_param_importances(study)
-    with open(results_path, 'a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([input_dataset,best['alpha'], best['c'], best['beta'], sigma, importances])
