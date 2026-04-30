@@ -117,28 +117,43 @@ class WeightedGATGraphNet(nn.Module):
         return F.log_softmax(self.classifier(x), dim=1)
 
 # ------------------- Training & Evaluation -------------------
-def train_graph(model, loader, optimizer, device):
+def train_graph(model, loader, optimizer, device, task_type='classification'):
     model.train()
     total_loss = 0
     for batch in loader:
         batch = batch.to(device)
         optimizer.zero_grad()
         out = model(batch.x, batch.edge_index, batch=batch.batch, edge_weight=batch.edge_weight if hasattr(batch, 'edge_weight') else None)
-        loss = F.nll_loss(out, batch.y)
-        loss.backward()
+
+        if task_type == 'classification':
+            loss = F.nll_loss(out, batch.y)
+            loss.backward()
+        else: 
+            loss = F.mse_loss(out.squeeze, batch.y)
+            loss.backward()
+
         optimizer.step()
         total_loss += loss.item()
     return total_loss / len(loader)
 
-def test_graph(model, loader, device):
+def test_graph(model, loader, device, task_type='classification'):
     model.eval()
     correct = 0
     total = 0
+    score = 0
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
             out = model(batch.x, batch.edge_index, batch=batch.batch, edge_weight=batch.edge_weight if hasattr(batch, 'edge_weight') else None)
-            pred = out.argmax(dim=1)
-            correct += pred.eq(batch.y).sum().item()
-            total += batch.y.size(0)
-    return correct/total 
+
+            if task_type == 'classification':
+                pred = out.argmax(dim=1)
+                correct += pred.eq(batch.y).sum().item()
+                total += batch.y.size(0)
+            else:
+                error = (out.squeeze() - batch.y.float()).abs().sum().item()
+                score += error
+    if task_type == 'classification':
+        return correct/total 
+    else:
+        return 

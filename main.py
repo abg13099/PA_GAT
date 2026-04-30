@@ -6,15 +6,17 @@ import random
 import numpy as np
 import torch
 import torch.optim as optim
+from torch.utils.data import dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GAT, GIN, GCN
 from sklearn.model_selection import StratifiedKFold
 from pA_GAT_60_20_20 import train_graph, test_graph, WeightedGATGraphNet
-from data_loader import prepare_tu_dataset
+from data_loader import prepare_tu_dataset, prepare_zinc_dataset, prepare_ogb_dataset
 from benchmark_diff_pool import DiffPool
 from benchmark_gin import GIN0
 from benchmark_graphsage import GraphSAGE
 from benchmark_gcn import GCN
+from itertools import product 
 
 # ------------------- Utility: set seeds -------------------
 def set_seed(seed):
@@ -48,93 +50,38 @@ def k_fold(dataset, folds=10, seed=42):
 
     return train_indices, val_indices, test_indices
 
-def run_model(build_model_fn, dataset, splits, num_features, num_classes, device, results_path, model_name):
-    train_indices, test_indices = splits
-    all_test_acc = []
-    
-    for fold_idx, (train_idx, test_idx) in enumerate(zip(train_indices, test_indices)):
-        set_seed(42 + fold_idx)
-        
-        train_dataset = [dataset[i] for i in train_idx]
-        test_dataset  = [dataset[i] for i in test_idx]
-        
-        # val split carved from train
-        val_size = int(0.1 * len(train_dataset))
-        val_dataset   = train_dataset[:val_size]
-        train_dataset = train_dataset[val_size:]
-        
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False)
-        test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False)
-        
-        # only this line differs per model
-        model = build_model_fn(num_features, num_classes).to(device)
-        
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-        
-        best_val_acc = 0
-        patience = 0
-        early_stop = 1000
-        
-        for epoch in range(1, 3001):
-            if model_name == "DiffPool":
-                train_graph_diffpool(model, train_loader, optimizer, device)
-            else:
-                train_graph(model, train_loader, optimizer, device)
-            val_acc = test_graph(model, val_loader, device)  # val not test
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                patience = 0
-            else:
-                patience += 1
-            if patience > early_stop:
-                break
-        
-        test_acc = test_graph(model, test_loader, device)
-        print(f"[{model_name}] Fold {fold_idx+1} | Test {test_acc:.4f}")
-        all_test_acc.append(test_acc)
-    
-    mean_acc = float(np.mean(all_test_acc))
-    std_acc  = float(np.std(all_test_acc))
-    
-    with open(results_path, 'a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([model_name, mean_acc, std_acc, all_test_acc])
-    
-    return mean_acc, std_acc
-
-def get_model(model_name, num_features, num_classes, max_nodes):
+def get_model(model_name, num_features, num_classes, max_nodes, hidden_dim, num_layers, dropout_rate):
     """Instantiates a fresh model for each fold."""
     if model_name == "PAGAT":
         return WeightedGATGraphNet(
-            in_dim=num_features, hidden_dim=64, num_layers=3, 
-            num_classes=num_classes, dropout_rate=0.5, heads=4
+            in_dim=num_features, hidden_dim=hidden_dim, num_layers=num_layers, 
+            num_classes=num_classes, dropout_rate=dropout_rate, heads=4
             )
-    elif model_name == "GRAPHSAGE":
+    elif model_name == "GraphSAGE":
         return GraphSAGE(
                 num_features=num_features,
                 num_classes=num_classes,
-                num_layers=3,
-                hidden=64
+                num_layers=num_layers,
+                hidden=hidden_dim
                 )
     elif model_name == "GIN":
         return GIN0(
             num_features=num_features, 
             num_classes=num_classes, 
-            num_layers=3, 
-            hidden=64
+            num_layers=num_layers, 
+            hidden=hidden_dim
             )
     elif model_name == "GCN":
         return GCN(
             num_features=num_features, 
             num_classes=num_classes, 
-            num_layers=3, 
-            hidden=64
+            num_layers=num_layers, 
+            hidden=hidden_dim
             )
     elif model_name == "DiffPool":
         return DiffPool(
             in_dim=num_features, num_classes=num_classes,
-            num_layers=4, hidden=64,
+            num_layers=num_layers, hidden=hidden_dim,
             max_nodes=max_nodes, ratio=0.25
             )
     else:
@@ -154,7 +101,7 @@ def train_graph_diffpool(model, loader, optimizer, device):
     return total_loss / len(loader)
 
 # ---------------- Experiment ---------------
-def run_experiment(model_name, dataset, splits, num_features, num_classes, device, results_path, max_nodes):
+def run_experiment(model_name, dataset, splits, num_features, num_classes, device, max_nodes, hidden_dim, num_layers, dropout_rate, lr, weight_decay, regression=False):
     train_indices, val_indices, test_indices = splits
     all_test_acc = []
 
@@ -169,10 +116,21 @@ def run_experiment(model_name, dataset, splits, num_features, num_classes, devic
         val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False) 
         test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False)
 
-        model = get_model(model_name, num_features, num_classes, max_nodes).to(device) 
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4) 
+        model = get_model(
+                model_name=model_name,
+                num_features=num_features,
+                num_classes=num_classes,
+                max_nodes=max_nodes,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                dropout_rate=dropout_rate
+                ).to(device) 
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay) 
          
-        best_val_acc = 0 
+        if regression:
+            best_val_score = float('inf') 
+        else: 
+            best_val_score = 0
         best_model_weights = None
         patience = 0 
         early_stop = 100
@@ -182,8 +140,12 @@ def run_experiment(model_name, dataset, splits, num_features, num_classes, devic
 
             val_acc = test_graph(model, val_loader, device)
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            if val_acc > best_val_score and not regression:
+                best_val_score = val_acc
+                patience = 0
+                best_model_weights = copy.deepcopy(model.state_dict())
+            elif regression and vall_acc < best_val_score:
+                best_val_score = val_acc
                 patience = 0
                 best_model_weights = copy.deepcopy(model.state_dict())
             else:
@@ -203,9 +165,6 @@ def run_experiment(model_name, dataset, splits, num_features, num_classes, devic
     mean_acc = np.mean(all_test_acc)
     std_acc = np.std(all_test_acc)
 
-    with open(results_path, 'a', newline='') as f: 
-        writer = csv.writer(f) 
-        writer.writerow([model_name, input_dataset, mean_acc, std_acc, all_test_acc]) 
      
     return mean_acc, std_acc
 
@@ -215,31 +174,57 @@ if __name__ == '__main__':
     set_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    # Diffusion params for PAGAT
+    diffusion_params = dict(alpha=0.5,base_anisotropy_c=1.3,beta=0.07)
+
     # Requires input dataset
     if len(sys.argv) > 1:
         input_dataset = sys.argv[1]
+        if len(sys.argv) > 2:
+            alpha = sys.argv[2]
+            c = sys.argv[3]
+            beta = sys.argv[4]
     else:
         print("Please input a dataset")
         exit(1)   
 
-    # Diffusion params for PAGAT
-    diffusion_params = dict(alpha=3.24846,base_anisotropy_c=0.1668764,beta=0.1168307)
+    hidden_dims = [64]
+    num_layerss = [3,4]
+    dropout_rates = [0,0.1,0.5]
+    lrs = [1e-2,5e-4,1e-6]
+    weight_decays = [0, 1e-4]
+   
+    hyperparams = list(product(hidden_dims, num_layerss, dropout_rates, lrs, weight_decays))
+
+    generate_splits = True
+    regression=False
 
     # Prepare datasets
-    dataset_unweighted, num_classes, num_features = prepare_tu_dataset(name=input_dataset)
-    dataset_weighted, _, _ = prepare_tu_dataset(name=input_dataset, diffusion_params=diffusion_params)
+    if input_dataset == 'ZINC':
+        dataset_unweighted, num_classes, num_features, splits = prepare_zinc_dataset(root='data/ZINC/unweighted',name=input_dataset)
+        dataset_weighted, num_classes, num_features, splits = prepare_zinc_dataset(root='data/ZINC/weighted',name=input_dataset)
+        generate_splits = False
+        regression=True
+    elif "ogbg" in input_dataset:
+        dataset_unweighted, num_classes, num_features, splits = prepare_ogb_dataset(root='data/OBG/unweighted',name=input_dataset)
+        dataset_weighted, num_classes, num_features, splits = prepare_ogb_dataset(root='data/OBG/weighted',name=input_dataset)
+        generate_splits = False
+    else:
+        dataset_unweighted, num_classes, num_features = prepare_tu_dataset(root='data/TU/unweighted',name=input_dataset)
+        dataset_weighted, _, _ = prepare_tu_dataset(root='data/TU/weighted',name=input_dataset, diffusion_params=diffusion_params)
+
     max_nodes_unweighted = max(data.num_nodes for data in dataset_unweighted)
 
     # Models to test
-    models = ("PAGAT", "GIN", "GCN", "DiffPool", "GraphSage")
+    models = ("PAGAT", "GIN", "GCN", "DiffPool", "GraphSAGE")
 
     # Result directory
     os.makedirs("./results", exist_ok=True)
     results_file = "./results/results.csv"
 
     # Write CSV header row
-    with open(results_file, 'w', newline='') as f:
-        csv.writer(f).writerow(["Model", "Dataset", "Mean Acc", "Std Dev", "All Folds"])
+    #with open(results_file, 'w', newline='') as f:
+    #    csv.writer(f).writerow(["Model", "Dataset", "Mean Acc", "Std Dev", "All Folds"])
 
     # Loop through models
     for model_name in models:
@@ -250,7 +235,22 @@ if __name__ == '__main__':
             print("A")
             current_dataset = dataset_unweighted
 
-        splits = k_fold(current_dataset, folds=10, seed=42)
-
-        mean, std = run_experiment(model_name, current_dataset, splits, num_features, num_classes, device, results_file, max_nodes_unweighted)
-
+        if generate_splits:
+            splits = k_fold(current_dataset, folds=10, seed=42)
+        max_mean = -1
+        saved_std = -1
+        saved_hidden_dim = saved_num_layers = saved_dropout_rate = saved_lr = saved_weight_decay = -1
+        for hidden_dim, num_layers, dropout_rate, lr, weight_decay in hyperparams:
+            mean, std = run_experiment(model_name, current_dataset, splits, num_features, num_classes, device, max_nodes_unweighted, hidden_dim, num_layers, dropout_rate, lr, weight_decay, regression=regression)
+            if (mean > max_mean and not regression) or (regression and mean < max_mean):
+                max_mean = mean
+                saved_std = std
+                saved_hidden_dim = hidden_dim
+                saved_num_layers = num_layers
+                saved_dropout_rate = dropout_rate
+                saved_lr = lr
+                saved_weight_decay = weight_decay
+            
+        with open(results_file, 'a', newline='') as f: 
+            writer = csv.writer(f) 
+            writer.writerow([model_name, input_dataset, max_mean, saved_std, saved_hidden_dim, saved_num_layers, saved_dropout_rate, saved_lr, saved_weight_decay]) 

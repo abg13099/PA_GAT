@@ -40,8 +40,7 @@ class GIN0(torch.nn.Module):
         self.lin1.reset_parameters()
         self.lin2.reset_parameters()
 
-    def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+    def forward(self, x, edge_index, batch, edge_weight=None):
         x = self.conv1(x, edge_index)
         for conv in self.convs:
             x = conv(x, edge_index)
