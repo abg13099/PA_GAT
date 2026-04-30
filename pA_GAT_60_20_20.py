@@ -27,7 +27,7 @@ from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
 from community import community_louvain as co_louvain
 import random
-from torch_geometric.datasets import TUDataset
+from torch_geometric.datasets import Planetoid, TUDataset, WebKB, Coauthor
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.cluster import SpectralClustering
@@ -361,7 +361,7 @@ class WeightedGATGraphNet(nn.Module):
 
         self.classifier = nn.Linear(hidden_dim * heads, num_classes)
 
-    def forward(self, x, edge_index, batch, edge_weight=None):
+    def forward(self, x, edge_index, edge_weight=None):
         if edge_weight is not None:
             edge_weight = softmax(edge_weight, edge_index[0])
         for i, conv in enumerate(self.convs):
@@ -369,7 +369,6 @@ class WeightedGATGraphNet(nn.Module):
             x = self.bns[i](x)
             x = F.elu(x)
             x = self.dropout(x)
-        x = global_mean_pool(x, batch)
         return F.log_softmax(self.classifier(x), dim=1)
 
 # ------------------- Training & Evaluation -------------------
@@ -398,6 +397,62 @@ def test_graph(model, loader, device):
             correct += pred.eq(batch.y).sum().item()
             total += batch.y.size(0)
     return correct/total 
+
+def prepare_planetoid_dataset(name, root='data/Planetoid', diffusion_params=None):
+
+    dataset = Planetoid(root=root, name=name)
+    data = dataset[0]
+    
+    if diffusion_params:
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features 
+
+def prepare_webkb_dataset(name, root='data/WebKB', diffusion_params=None, split=0):
+    
+    dataset = WebKB(root=root, name=name)
+    data = dataset[0]
+    data = extract_largest_connected_component(data)
+
+    data.train_mask = data.train_mask[:, split]
+    data.val_mask   = data.val_mask[:, split]
+    data.test_mask  = data.test_mask[:, split]
+
+    if diffusion_params:
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features 
+
+def prepare_coauthor_dataset(name, root='data/Coauthor', diffusion_params=None):
+    dataset = Coauthor(root=root, name=name)
+    data = dataset[0]
+    data = extract_largest_connected_component(data)
+
+    num_nodes = data.num_nodes
+    indices = np.random.permutation(num_nodes)
+
+    #20/30/50 Split for Coautor Datasets
+    train = int((0.2 * num_nodes))
+    val = int((0.5 * num_nodes))
+
+    data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    
+    data.train_mask[indices[:train]] = True
+    data.val_mask[indices[train:val]] = True
+    data.test_mask[indices[val:]] = True
+    
+    if diffusion_params:
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features 
 
 def prepare_tu_dataset(name, root='data/TU', diffusion_params=None):
 

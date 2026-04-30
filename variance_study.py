@@ -16,7 +16,7 @@ from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
 from community import community_louvain as co_louvain
 import random
-from torch_geometric.datasets import TUDataset
+from torch_geometric.datasets import Planetoid, TUDataset, WebKB, Coauthor
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.cluster import SpectralClustering
@@ -30,6 +30,11 @@ import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 from optuna.samplers import CmaEsSampler
+
+WEBKB_DATASETS     = {'Texas', 'Cornell', 'Wisconsin'}
+PLANETOID_DATASETS = {'Cora', 'Citeseer', 'Pubmed'}
+COAUTHOR_DATASETS  = {'CS', 'Physics'}
+
 # ------------------- Utility: set seeds -------------------
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -354,7 +359,7 @@ class WeightedGATGraphNet(nn.Module):
 
         self.classifier = nn.Linear(hidden_dim * heads, num_classes)
 
-    def forward(self, x, edge_index, batch, edge_weight=None):
+    def forward(self, x, edge_index, edge_weight=None):
         if edge_weight is not None:
             edge_weight = softmax(edge_weight, edge_index[0])
         for i, conv in enumerate(self.convs):
@@ -362,35 +367,37 @@ class WeightedGATGraphNet(nn.Module):
             x = self.bns[i](x)
             x = F.elu(x)
             x = self.dropout(x)
-        x = global_mean_pool(x, batch)
         return F.log_softmax(self.classifier(x), dim=1)
 
 # ------------------- Training & Evaluation -------------------
-def train_graph(model, loader, optimizer, device):
+def train_graph(model, data, optimizer):
     model.train()
-    total_loss = 0
-    for batch in loader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        out = model(batch.x, batch.edge_index, batch.batch, edge_weight = batch.edge_weight if hasattr(batch, 'edge_weight') else None)
-        loss = F.nll_loss(out, batch.y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
+    optimizer.zero_grad()
 
-def test_graph(model, loader, device):
+    out = model(data.x, data.edge_index, edge_weight = data.edge_weight if hasattr(data, 'edge_weight') else None)
+
+    loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])
+
+    loss.backward()
+    optimizer.step()
+
+    return loss 
+
+def test_graph(model, data):
     model.eval()
-    correct = 0
-    total = 0
     with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            out = model(batch.x, batch.edge_index, batch.batch, edge_weight = batch.edge_weight if hasattr(batch, 'edge_weight') else None)
-            pred = out.argmax(dim=1)
-            correct += pred.eq(batch.y).sum().item()
-            total += batch.y.size(0)
-    return correct/total 
+        out = model(data.x, data.edge_index, edge_weight = data.edge_weight if hasattr(data, 'edge_weight') else None)
+        pred = out.argmax(dim=1)
+
+        val_correct = pred[data.val_mask].eq(data.y[data.val_mask]).sum().item()
+        val_total = data.val_mask.sum().item()
+        val_acc = val_correct / val_total if val_total > 0 else 0.0
+
+        test_correct = pred[data.test_mask].eq(data.y[data.test_mask]).sum().item()
+        test_total = data.test_mask.sum().item()
+        test_acc = test_correct / test_total if test_total > 0 else 0.0
+
+    return val_acc, test_acc
 
 def compute_structural_features(data):
     G = to_networkx(data, to_undirected = True)
@@ -431,6 +438,62 @@ def prepare_tu_dataset(name, root='data/TU', diffusion_params=None):
         dataset = processed
     return dataset, num_classes, num_features 
 
+def prepare_planetoid_dataset(name, root='data/Planetoid', diffusion_params=None):
+
+    dataset = Planetoid(root=root, name=name)
+    data = dataset[0]
+    
+    if diffusion_params:
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features 
+
+def prepare_webkb_dataset(name, root='data/WebKB', diffusion_params=None, split=0):
+    
+    dataset = WebKB(root=root, name=name)
+    data = dataset[0]
+    data = extract_largest_connected_component(data)
+
+    data.train_mask = data.train_mask[:, split]
+    data.val_mask   = data.val_mask[:, split]
+    data.test_mask  = data.test_mask[:, split]
+
+    if diffusion_params:
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features 
+
+def prepare_coauthor_dataset(name, root='data/Coauthor', diffusion_params=None):
+    dataset = Coauthor(root=root, name=name)
+    data = dataset[0]
+    data = extract_largest_connected_component(data)
+
+    num_nodes = data.num_nodes
+    indices = np.random.permutation(num_nodes)
+
+    #20/30/50 Split for Coautor Datasets
+    train = int((0.2 * num_nodes))
+    val = int((0.5 * num_nodes))
+
+    data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    
+    data.train_mask[indices[:train]] = True
+    data.val_mask[indices[train:val]] = True
+    data.test_mask[indices[val:]] = True
+    
+    if diffusion_params:
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features 
+
 def k_fold(dataset, folds=10, seed=42):
     skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
 
@@ -451,58 +514,63 @@ def objective(trial, input_dataset, device):
     diffusion_params = dict(alpha=alpha, base_anisotropy_c=c, beta=beta)
 
     try:
-        dataset, num_classes, num_features = prepare_tu_dataset(
-             name=input_dataset, diffusion_params=diffusion_params
-         )
+        if input_dataset in WEBKB_DATASETS:
+            data, num_classes, num_features = prepare_webkb_dataset(
+                input_dataset, diffusion_params=diffusion_params, split=0)
+        elif input_dataset in COAUTHOR_DATASETS:
+            data, num_classes, num_features = prepare_coauthor_dataset(
+                input_dataset, diffusion_params=diffusion_params)
+        elif input_dataset in PLANETOID_DATASETS:
+            data, num_classes, num_features = prepare_planetoid_dataset(
+                input_dataset, diffusion_params=diffusion_params)    
+        else:
+            raise Exception("Invalid Dataset")
     except Exception as e:
          print(f"Preprocessing failed: {e} skipping combination")
          raise optuna.exceptions.TrialPruned()
 
     print(f"Running experiment with: alpha: {alpha}, c: {c}, beta: {beta}")
 
-    train_indices, test_indices = k_fold(dataset, folds=5, seed=42)
-    fold_accs = []
 
-    for fold_idx in range(5):
-        train_dataset = [dataset[i] for i in train_indices[fold_idx]]
-        test_dataset = [dataset[i] for i in test_indices[fold_idx]]
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-        model = WeightedGATGraphNet(
-            in_dim=num_features, hidden_dim=64, num_layers=2,
-            num_classes=num_classes, dropout_rate=0.5, heads=8
-        ).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    data = data.to(device)
 
-        best_acc = 0.0
-        patience_count = 0
-        PATIENCE=50
+    model = WeightedGATGraphNet(
+        in_dim=num_features, hidden_dim=64, num_layers=2,
+        num_classes=num_classes, dropout_rate=0.5, heads=8
+    ).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
 
-        for epoch in range(1,501):
-            train_graph(model, train_loader, optimizer, device)
-            
-            acc = test_graph(model, test_loader, device)
-            if acc > best_acc:
-                best_acc = acc
-                patience_count = 0
-            else:
-                patience_count += 1
-            if patience_count >= 50:
-                break
+    test_accs = []
 
-        fold_accs.append(best_acc)
-        del model, optimizer, train_loader, test_loader
-        del train_dataset, test_dataset
-        gc.collect()
+    best_val_acc = 0.0
+    best_test_acc = 0.0
+    patience_count = 0
+    PATIENCE = 50
 
-        trial.report(float(np.mean(fold_accs)), step=fold_idx)
+    for epoch in range(1,501):
+        loss = train_graph(model, data, optimizer)
+        
+        val_acc, test_acc = test_graph(model, data)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_test_acc = test_acc
+            patience_count = 0
+        else:
+            patience_count += 1
+        if patience_count >= 50:
+            break
+
+        trial.report(best_val_acc, step = epoch)
         if trial.should_prune():
             print("Was gonna prune")
-            # raise optuna.exceptions.TrialPruned()
+            del optimizer, data, model
+            gc.collect()
+            raise optuna.exceptions.TrialPruned()
 
-    del dataset
+    del optimizer, data, model
     gc.collect()
-    return float(np.mean(fold_accs))
+    return float(best_test_acc)
 
 if __name__ == "__main__":
     set_seed(42)
