@@ -12,30 +12,12 @@ Created on Fri Dec  5 12:04:26 2025
 @author: maktas1
 """
 
-import numpy as np
-import networkx as nx
-from scipy.linalg import eigh
 from sklearn.externals.array_api_compat.numpy import test
 import torch
 import torch.nn.functional as F
-from torch import nn, optim
-import torch_geometric # Added this line
-from torch_geometric.utils import to_networkx
-from torch_geometric.nn import GATConv
-from torch_geometric.nn import global_mean_pool 
+from torch import nn 
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
-from community import community_louvain as co_louvain
-import random
-from torch_geometric.datasets import TUDataset
-from torch_geometric.loader import DataLoader
-from sklearn.model_selection import StratifiedKFold
-from sklearn.cluster import SpectralClustering
-from networkx.algorithms import community
-from itertools import product
-import sys
-import os
-import csv
 
 class WeightedGATConv(MessagePassing):
     def __init__(self, in_channels, out_channels, heads=1, concat=True, dropout=0.0, add_self_loops=True, bias=True):
@@ -105,7 +87,7 @@ class WeightedGATGraphNet(nn.Module):
 
         self.classifier = nn.Linear(hidden_dim * heads, num_classes)
 
-    def forward(self, x, edge_index, batch, edge_weight=None):
+    def forward(self, x, edge_index, edge_weight=None):
         if edge_weight is not None:
             edge_weight = softmax(edge_weight, edge_index[0])
         for i, conv in enumerate(self.convs):
@@ -113,47 +95,26 @@ class WeightedGATGraphNet(nn.Module):
             x = self.bns[i](x)
             x = F.elu(x)
             x = self.dropout(x)
-        x = global_mean_pool(x, batch)
-        return F.log_softmax(self.classifier(x), dim=1)
+        return self.classifier(x)
 
 # ------------------- Training & Evaluation -------------------
-def train_graph(model, loader, optimizer, device, task_type='classification'):
+def train_graph(model, data, optimizer):
     model.train()
-    total_loss = 0
-    for batch in loader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        out = model(batch.x, batch.edge_index, batch=batch.batch, edge_weight=batch.edge_weight if hasattr(batch, 'edge_weight') else None)
-
-        if task_type == 'classification':
-            loss = F.nll_loss(out, batch.y)
-            loss.backward()
-        else: 
-            loss = F.mse_loss(out.squeeze, batch.y)
-            loss.backward()
-
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
-
-def test_graph(model, loader, device, task_type='classification'):
-    model.eval()
-    correct = 0
-    total = 0
-    score = 0
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            out = model(batch.x, batch.edge_index, batch=batch.batch, edge_weight=batch.edge_weight if hasattr(batch, 'edge_weight') else None)
-
-            if task_type == 'classification':
-                pred = out.argmax(dim=1)
-                correct += pred.eq(batch.y).sum().item()
-                total += batch.y.size(0)
-            else:
-                error = (out.squeeze() - batch.y.float()).abs().sum().item()
-                score += error
-    if task_type == 'classification':
-        return correct/total 
+    optimizer.zero_grad()
+    if isinstance(model, WeightedGATGraphNet):
+        out = model(data.x, data.edge_index, edge_weight=data.edge_weight if hasattr(data, 'edge_weight') else None)
     else:
-        return 
+        out = model(data.x, data.edge_index, edge_weight=data.edge_weight)
+    loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
+    loss.backward()
+    optimizer.step()
+    return loss 
+
+def test_graph(model, data):
+    model.eval()
+    with torch.no_grad():
+        out = model(data.x, data.edge_index, edge_weight=data.edge_weight if hasattr(data, 'edge_weight') else None)
+    pred = out.argmax(dim=1)
+    val_acc = pred[data.val_mask].eq(data.y[data.val_mask]).sum().item() / data.val_mask.sum().item()
+    test_acc = pred[data.test_mask].eq(data.y[data.test_mask]).sum().item() / data.test_mask.sum().item()
+    return val_acc, test_acc

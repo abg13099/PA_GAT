@@ -1,19 +1,11 @@
 import numpy as np
 import networkx as nx
 import torch
-from torch_geometric.utils import softmax
 from community import community_louvain as co_louvain
-import random
-from torch_geometric.datasets import TUDataset
-from torch_geometric.datasets import ZINC 
-from ogb.graphproppred import PygGraphPropPredDataset
-from torch_geometric.loader import DataLoader
+import torch_geometric
 from torch_geometric.utils import to_networkx
-from sklearn.model_selection import StratifiedKFold
-from sklearn.cluster import SpectralClustering
-from networkx.algorithms import community
+from torch_geometric.datasets import Planetoid, WebKB, Coauthor 
 from scipy.linalg import eigh
-from itertools import product
 
 def extract_largest_connected_component(data):
     G_nx = to_networkx(data, to_undirected=True)
@@ -261,102 +253,58 @@ def compute_diffused_laplacian_weights(data,
     data = attach_weights_from_D(data, D, node_to_idx, nodes_list)
     return data, num_communities
 
+def prepare_planetoid_dataset(name, root='data/Planetoid', diffusion_params=None):
 
-def compute_structural_features(data):
-    G = to_networkx(data, to_undirected = True)
-    nodes = list(G.nodes())
-    degrees = [G.degree(n) for n in nodes]
-    clustering = list(nx.clustering(G).values())
-    features = torch.tensor(
-        [[d, c] for d, c in zip(degrees, clustering)],
-        dtype=torch.float
-    )
-    data.x = features
-    return data
+    dataset = Planetoid(root=root, name=name)
+    data = dataset[0]
+    
+    if diffusion_params:
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features 
 
-def prepare_tu_dataset(name, root='data/TU', diffusion_params=None):
+def prepare_webkb_dataset(name, root='data/WebKB', diffusion_params=None, split=0):
+    
+    dataset = WebKB(root=root, name=name)
+    data = dataset[0]
+    data = extract_largest_connected_component(data)
 
-    dataset = TUDataset(root=root, name=name, use_node_attr=True)
-
-    num_classes = dataset.num_classes
-    num_features = dataset.num_features
-
-    #print(f"First graph x: {dataset[0].x}")
-    #print(f"First graph y: {dataset[0].y}")
-
-    #Sometimes data is empty
-    dataset = [data for data in dataset if data.x is not None and data.y is not None]
+    data.train_mask = data.train_mask[:, split]
+    data.val_mask   = data.val_mask[:, split]
+    data.test_mask  = data.test_mask[:, split]
 
     if diffusion_params:
-        processed=[]
-        for data in dataset:
-            try:
-                data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
-            except Exception as e:
-                print(f"Error when computing diffused laplacian: {e}")
-            processed.append(data)
-        dataset = processed
-    return dataset, num_classes, num_features 
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features 
 
-def prepare_zinc_dataset(name, root='data/ZINC', subset=True,diffusion_params=None):
-    train_dataset = ZINC(root=root, subset=subset, split='train')
-    val_dataset = ZINC(root=root, subset=subset, split='val')
-    test_dataset = ZINC(root=root, subset=subset, split='test')
+def prepare_coauthor_dataset(name, root='data/Coauthor', diffusion_params=None):
+    dataset = Coauthor(root=root, name=name)
+    data = dataset[0]
+    data = extract_largest_connected_component(data)
 
-    num_classes = 1 
-    num_features = train_dataset.num_features
+    num_nodes = data.num_nodes
+    indices = np.random.permutation(num_nodes)
 
-    full_dataset = list(train_dataset) + list(val_dataset) + list(test_dataset)
+    #20/30/50 Split for Coautor Datasets
+    train = int((0.2 * num_nodes))
+    val = int((0.5 * num_nodes))
 
-    train_end = len(train_dataset)
-    val_end = train_end + len(val_dataset)
-
-    train_indices = torch.arange(0, train_end)
-    val_indices = torch.arange(train_end, val_end)
-    test_indices = torch.arange(val_end, len(full_dataset))
-
-    processed = []
-    for data in full_dataset:
-        if data.x is not None and data.y is not None:
-            if diffusion_params:
-                try:
-                    data, _ = compute_diffused_laplacian_weights(data, **diffusion_params)
-                except Exception as e:
-                    print(f"Error when computing diffused laplacian: {e}")
-            processed.append(data)
+    data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
     
-    splits = ([train_indices], [val_indices], [test_indices])
-
-    return processed, num_classes, num_features, splits
-
-def prepare_ogb_dataset(name, root='data/OGB', diffusion_params=None):
-    dataset = PygGraphPropPredDataset(name=name, root=root)
-
-    split_idx = dataset.get_idx_split()
-    train_indices = split_idx["train"]
-    val_indices = split_idx["val"]
-    test_indices = test_idx["test"]
-
-    num_classes = dataset.num_classes
-    num_features = dataset.num_features
-    processed = []
-
-    for data in dataset:
-        if hasattr(data, 'x') == False or data.x is None:
-            data = compute_structural_features(data)
-            num_features = data.x.shape[1]
-
-        if data.y is not None:
-            if data.y.dim() > 1:
-                data.y = data.y.squeeze()
-
-            if diffusion_params: 
-                try:
-                    data, _ = compute_diffused_laplacian_weights(data, **diffusion_params)
-                except Exception as e:
-                    print(f"Error when computing diffused laplacian: {e}")
-            processed.append(data)
-
-    splits = ([train_indices], [val_indices], [test_indices])
-
-    return processed, num_classes, num_features, splits
+    data.train_mask[indices[:train]] = True
+    data.val_mask[indices[train:val]] = True
+    data.test_mask[indices[val:]] = True
+    
+    if diffusion_params:
+        try:
+            data,_ = compute_diffused_laplacian_weights(data, **diffusion_params)
+        except Exception as e:
+            print(f"Error computing diffusion params: {e}")
+    return data, dataset.num_classes, dataset.num_features
